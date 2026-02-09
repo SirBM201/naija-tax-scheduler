@@ -1,12 +1,13 @@
-name: NTG Scheduler
+name: Naija Tax Guide Scheduler
 
 on:
   schedule:
-    - cron: "*/30 * * * *"
+    # Runs every 15 minutes
+    - cron: "*/15 * * * *"
   workflow_dispatch: {}
 
 jobs:
-  run:
+  run-jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
@@ -14,7 +15,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -24,9 +25,9 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run scheduler jobs
+      - name: Run scheduler
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: |
-          python -m scheduler.run_jobs
+          python scheduler/run_jobs.py
