@@ -1,16 +1,15 @@
-# Naija Tax Guide - Scheduler
+# Naija Tax Guide Scheduler
 
-This repo runs background maintenance jobs:
-- Apply scheduled plan changes (pending_plan_code)
-- Deactivate expired subscriptions (after grace)
+Runs background maintenance jobs for Naija Tax Guide using Supabase Service Role.
 
-## Env vars required
+## What it does
+- Applies scheduled plan changes (pending_plan_code)
+- Deactivates expired subscriptions (expires_at + grace_days)
+- Cleans up old daily_question_usage rows
+
+## Setup (GitHub Actions)
+Add these repo secrets:
 - SUPABASE_URL
 - SUPABASE_SERVICE_ROLE_KEY
 
-## Run locally
-python -m scheduler.run_jobs
-
-## Deploy later (Koyeb paid / other cron)
-Run command:
-python -m scheduler.run_jobs
+The workflow runs every 30 minutes and can be triggered manually.
