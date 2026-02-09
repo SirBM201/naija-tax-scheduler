@@ -1,70 +1,189 @@
-# app/scheduler/run_once.py
+# scheduler/run_jobs.py
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from typing import Any, Dict, List
+import os
+from datetime import datetime, timezone, timedelta
+from typing import Any, Dict, Optional
 
-from ..core.supabase_client import supabase
-from ..services.subscriptions_service import apply_scheduled_change_if_due
+from supabase import create_client
 
 
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def expire_ai_credits_best_effort() -> Dict[str, Any]:
-    """
-    Calls your SQL function expire_ai_credits() if it exists.
-    """
+def _parse_iso(value: str) -> Optional[datetime]:
     try:
-        res = supabase().rpc("expire_ai_credits", {}).execute()
-        return {"ok": True, "result": res.data}
-    except Exception as e:
-        return {"ok": False, "error": f"expire_ai_credits failed: {e}"}
+        v = value.replace("Z", "+00:00")
+        return datetime.fromisoformat(v)
+    except Exception:
+        return None
 
 
-def apply_due_plan_changes_best_effort() -> Dict[str, Any]:
-    """
-    Finds all active subs that have pending plan changes due, then applies them.
-    """
-    db = supabase()
-    now = _now_utc().isoformat()
+def _iso(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
-    try:
-        rows = (
-            db.table("user_subscriptions")
-            .select("account_id,pending_plan_code,pending_starts_at,is_active")
-            .eq("is_active", True)
-            .not_.is_("pending_plan_code", "null")
-            .not_.is_("pending_starts_at", "null")
-            .lte("pending_starts_at", now)
-            .limit(5000)
-            .execute()
-        )
-        data: List[Dict[str, Any]] = rows.data or []
-    except Exception as e:
-        return {"ok": False, "error": f"query pending subs failed: {e}"}
 
-    changed = 0
-    errors = 0
-    for r in data:
-        aid = (r.get("account_id") or "").strip()
-        if not aid:
-            continue
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+
+if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+    raise RuntimeError("Missing SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY")
+
+
+sb = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+
+
+def _get_plan(plan_code: str) -> Optional[Dict[str, Any]]:
+    if not plan_code:
+        return None
+    res = sb.table("plans").select("*").eq("plan_code", plan_code).limit(1).execute()
+    return res.data[0] if res.data else None
+
+
+def _build_expiry_from_plan(plan_code: str, starts_at: datetime) -> datetime:
+    plan = _get_plan(plan_code)
+    duration_days = 30
+    if plan:
         try:
-            out = apply_scheduled_change_if_due(aid)
-            if out:
-                changed += 1
+            duration_days = int(plan.get("duration_days") or 30)
         except Exception:
-            errors += 1
+            duration_days = 30
+    return starts_at + timedelta(days=duration_days)
 
-    return {"ok": True, "checked": len(data), "changed": changed, "errors": errors}
+
+def _deactivate_row(row_id: str, reason: str) -> None:
+    try:
+        sb.table("user_subscriptions").update(
+            {"is_active": False, "status": reason, "updated_at": _iso(_now_utc())}
+        ).eq("id", row_id).execute()
+    except Exception:
+        pass
 
 
-def run_once() -> Dict[str, Any]:
+def _activate_new_subscription(account_id: str, plan_code: str) -> None:
     """
-    One scheduler tick.
+    Create a fresh active row and deactivate any current active row.
+    (Credits reset is handled by your API when you integrate it there;
+     scheduler focuses on subscription rows.)
     """
-    out1 = expire_ai_credits_best_effort()
-    out2 = apply_due_plan_changes_best_effort()
-    return {"ok": True, "expire_ai_credits": out1, "apply_due_plan_changes": out2}
+    # Deactivate existing active rows (best effort)
+    try:
+        sb.table("user_subscriptions").update(
+            {"is_active": False, "status": "replaced", "updated_at": _iso(_now_utc())}
+        ).eq("account_id", account_id).eq("is_active", True).execute()
+    except Exception:
+        pass
+
+    starts = _now_utc()
+    expires = _build_expiry_from_plan(plan_code, starts)
+
+    payload = {
+        "account_id": account_id,
+        "plan_code": plan_code,
+        "status": "active",
+        "started_at": _iso(starts),
+        "expires_at": _iso(expires),
+        "is_active": True,
+        "pending_plan_code": None,
+        "pending_starts_at": None,
+        "updated_at": _iso(_now_utc()),
+    }
+
+    try:
+        sb.table("user_subscriptions").insert(payload).execute()
+    except Exception:
+        pass
+
+
+def apply_scheduled_upgrades() -> int:
+    """
+    If an active row has:
+      pending_plan_code not null
+      pending_starts_at <= now
+    then activate new subscription.
+    """
+    now = _now_utc()
+    count = 0
+
+    res = (
+        sb.table("user_subscriptions")
+        .select("id,account_id,pending_plan_code,pending_starts_at")
+        .eq("is_active", True)
+        .not_.is_("pending_plan_code", "null")
+        .not_.is_("pending_starts_at", "null")
+        .limit(1000)
+        .execute()
+    )
+
+    for row in (res.data or []):
+        pending_plan = (row.get("pending_plan_code") or "").strip()
+        pending_starts_at = row.get("pending_starts_at")
+        starts_dt = _parse_iso(pending_starts_at) if isinstance(pending_starts_at, str) else None
+
+        if not pending_plan or not starts_dt:
+            continue
+        if now < starts_dt:
+            continue
+
+        # Clear pending on old row (best effort)
+        try:
+            sb.table("user_subscriptions").update(
+                {"pending_plan_code": None, "pending_starts_at": None, "updated_at": _iso(_now_utc())}
+            ).eq("id", row["id"]).execute()
+        except Exception:
+            pass
+
+        _activate_new_subscription(row["account_id"], pending_plan)
+        count += 1
+
+    return count
+
+
+def deactivate_expired_subscriptions() -> int:
+    """
+    Deactivate any is_active=true row where:
+      now > expires_at (+ optional grace_days from plan)
+    """
+    now = _now_utc()
+    count = 0
+
+    res = (
+        sb.table("user_subscriptions")
+        .select("id,account_id,plan_code,expires_at,is_active")
+        .eq("is_active", True)
+        .limit(2000)
+        .execute()
+    )
+
+    for row in (res.data or []):
+        exp = row.get("expires_at")
+        exp_dt = _parse_iso(exp) if isinstance(exp, str) else None
+        if not exp_dt:
+            continue
+
+        plan = _get_plan((row.get("plan_code") or "").strip())
+        grace_days = 0
+        if plan and plan.get("grace_days") is not None:
+            try:
+                grace_days = int(plan.get("grace_days") or 0)
+            except Exception:
+                grace_days = 0
+
+        grace_until = exp_dt + timedelta(days=grace_days)
+
+        if now > grace_until:
+            _deactivate_row(row["id"], reason="expired")
+            count += 1
+
+    return count
+
+
+def main() -> None:
+    upgraded = apply_scheduled_upgrades()
+    expired = deactivate_expired_subscriptions()
+    print(f"OK: scheduled_upgrades_applied={upgraded} expired_deactivated={expired}")
+
+
+if __name__ == "__main__":
+    main()
