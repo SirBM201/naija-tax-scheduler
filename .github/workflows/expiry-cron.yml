@@ -3,13 +3,16 @@ name: Expire Subscriptions
 on:
   schedule:
     - cron: "0 */6 * * *"
+  workflow_dispatch:
 
 jobs:
-  call-cron:
+  run:
     runs-on: ubuntu-latest
     steps:
-      - name: Call expiry endpoint
+      - name: Call expire-subscriptions cron
         run: |
-          curl -X POST \
-          https://incredible-nonie-bmsconcept-37359733.koyeb.app/internal/cron/expire-subscriptions \
-          -H "X-Admin-Key: ${{ secrets.ADMIN_API_KEY }}"
+          curl -sS -X POST \
+            "https://incredible-nonie-bmsconcept-37359733.koyeb.app/internal/cron/expire-subscriptions" \
+            -H "X-Admin-Key: ${{ secrets.ADMIN_API_KEY }}" \
+            -H "Content-Type: application/json" \
+            -d "{}"
